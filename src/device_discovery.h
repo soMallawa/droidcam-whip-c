@@ -1,6 +1,7 @@
 // Copyright (C) 2021 DEV47APPS, github.com/dev47apps
 #pragma once
-#include <util/threading.h>
+#include <pthread.h>
+#include "plugin.h"
 
 #ifdef TEST
 #define DEVICES_LIMIT 8

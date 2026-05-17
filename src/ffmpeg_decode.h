@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#include <obs.h>
+#include "plugin.h"
 
 #ifdef _MSC_VER
 #pragma warning(push)

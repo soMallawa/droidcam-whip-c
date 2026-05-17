@@ -17,10 +17,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #ifndef _WIN32
 # include <sys/select.h>
 #endif
-#include <util/platform.h>
-#if defined(TEST)
-#include <util/bmem.h>
-#endif
 
 #include <deque>
 

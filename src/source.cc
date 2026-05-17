@@ -5,30 +5,16 @@ This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 2 of the License, or
 (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include <errno.h>
+#include <pthread.h>
 #include <stdlib.h>
-#include <util/threading.h>
-#include <util/platform.h>
+#include <string.h>
 
-#if DROIDCAM_OVERRIDE
-#define ENABLE_GUI 1
-#endif
-
-#if ENABLE_GUI
-#include "obs.hpp"
-#include "obs-frontend-api.h"
-#include <QMainWindow>
-#include <QMessageBox>
-extern QMainWindow *main_window;
-#endif
+extern "C" {
+#include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
+}
 
 #include "plugin.h"
 #include "source.h"
@@ -38,71 +24,76 @@ extern QMainWindow *main_window;
 #include "net.h"
 #include "buffer_util.h"
 #include "device_discovery.h"
+#include "encoder_rtsp.h"
 
 #define FPS 25
 #define MILLI_SEC 1000
-#define NANO_SEC  1000000000
 
 extern char os_name_version[64];
 extern const char* bindIP;
 
-#define SOURCE_EXISTS() (os_event_try(plugin->stop_signal) == EAGAIN)
+#define SOURCE_EXISTS() (!plugin->stop_requested)
 
 struct droidcam_obs_source {
-    Tally_t tally;
     AdbMgr adbMgr;
     USBMux iosMgr;
     MDNS mdnsMgr;
     Decoder* video_decoder;
-    Decoder* audio_decoder;
-    obs_source_t *source;
-    os_event_t *stop_signal;
-    os_event_t *reset_signal;
-    os_event_t *comms_signal;
-    pthread_t audio_thread;
     pthread_t video_thread;
     pthread_t video_decode_thread;
-    pthread_t comms_thread;
-    enum video_range_type range;
-    bool is_showing;
+    volatile bool stop_requested;
+    volatile bool reset_requested;
+    volatile bool video_running;
     bool activated;
-    bool deactivateWNS;
-    bool enable_audio;
+    bool is_showing;
     bool use_hw;
     bool use_hdr;
-    bool audio_running;
-    bool video_running;
-    int video_width, video_height;
+    int video_width;
+    int video_height;
+    int fps;
     int usb_port;
     enum VideoFormat video_format;
     struct active_device_info device_info;
-    struct obs_source_audio obs_audio_frame;
-    struct obs_source_frame2 obs_video_frame;
-    uint64_t time_start;
-    #if DROIDCAM_OVERRIDE
-    std::vector<OBSSignal> signal_handlers;
-    #endif
-    Queue<CommsTask> comms_queue;
+    struct obs_source_frame2 video_frame;
+    EncoderRtspCtx *encoder;
+    char *rtsp_url;
+    uint8_t *bgr_frame;
+    size_t bgr_frame_size;
+    struct SwsContext *to_bgr;
+    enum video_format to_bgr_format;
+    int to_bgr_width;
+    int to_bgr_height;
+
+    droidcam_obs_source()
+        : video_decoder(NULL),
+          video_thread(0),
+          video_decode_thread(0),
+          stop_requested(false),
+          reset_requested(false),
+          video_running(false),
+          activated(false),
+          is_showing(false),
+          use_hw(false),
+          use_hdr(false),
+          video_width(0),
+          video_height(0),
+          fps(FPS),
+          usb_port(0),
+          video_format(FORMAT_AVC),
+          encoder(NULL),
+          rtsp_url(NULL),
+          bgr_frame(NULL),
+          bgr_frame_size(0),
+          to_bgr(NULL),
+          to_bgr_format(VIDEO_FORMAT_NONE),
+          to_bgr_width(0),
+          to_bgr_height(0) {
+        memset(&device_info, 0, sizeof(device_info));
+        memset(&video_frame, 0, sizeof(video_frame));
+    }
 };
 
-#if DROIDCAM_OVERRIDE
-static void signal_source_update(obs_source_t* source, const char* battery_level, int battery_alert) {
-    signal_handler_t *h = obs_source_get_signal_handler(source);
-    calldata_t cd;
-    calldata_init(&cd);
-    calldata_set_int(&cd, "battery_alert", battery_alert);
-    calldata_set_string(&cd, "battery_level", battery_level);
-    signal_handler_signal(h, "droidcam_source_update", &cd);
-    calldata_free(&cd);
-}
-#endif
-
-#define comms_task(t) do {\
-    plugin->comms_queue.add_item(t);\
-    os_event_signal(plugin->comms_signal);\
-    } while(0)
-
-static socket_t connect(struct droidcam_obs_source *plugin) {
+static socket_t connect_device(struct droidcam_obs_source *plugin) {
     Device* dev;
     AdbMgr* adbMgr = &plugin->adbMgr;
     USBMux* iosMgr = &plugin->iosMgr;
@@ -112,11 +103,11 @@ static socket_t connect(struct droidcam_obs_source *plugin) {
 
     dlog("connect device: id=%s type=%d", device_info->id, (int) device_info->type);
 
-    if (device_info->type == DeviceType::WIFI) {
+    if (device_info->type == WIFI) {
         return net_connect(device_info->ip, bindIP, device_info->port);
     }
 
-    if (device_info->type == DeviceType::MDNS) {
+    if (device_info->type == MDNS) {
         dev = mdnsMgr->GetDevice(device_info->id);
         if (dev) {
             return net_connect(dev->address, bindIP, device_info->port);
@@ -126,11 +117,11 @@ static socket_t connect(struct droidcam_obs_source *plugin) {
         goto out;
     }
 
-    if (device_info->type == DeviceType::ADB) {
+    if (device_info->type == ADB) {
         dev = adbMgr->GetDevice(device_info->id);
         if (dev) {
             if (adbMgr->DeviceOffline(dev)) {
-                elog("device is offline...");
+                elog("device is offline");
                 goto out;
             }
 
@@ -139,8 +130,7 @@ static socket_t connect(struct droidcam_obs_source *plugin) {
 
             if (plugin->usb_port < port_start) {
                 plugin->usb_port = port_start;
-            }
-            else if (plugin->usb_port > port_last) {
+            } else if (plugin->usb_port > port_last) {
                 plugin->usb_port = port_start;
                 adbMgr->ClearForwards(port_start, port_last);
             }
@@ -162,7 +152,7 @@ static socket_t connect(struct droidcam_obs_source *plugin) {
         goto out;
     }
 
-    if (device_info->type == DeviceType::IOS) {
+    if (device_info->type == IOS) {
         dev = iosMgr->GetDevice(device_info->id);
         if (dev) {
             return iosMgr->Connect(dev, device_info->port, &plugin->usb_port);
@@ -172,7 +162,7 @@ static socket_t connect(struct droidcam_obs_source *plugin) {
         goto out;
     }
 
-    out:
+out:
     return INVALID_SOCKET;
 }
 
@@ -187,16 +177,15 @@ read_frame(Decoder *decoder, socket_t sock, int *has_config)
     size_t len, config_len = 0;
     uint64_t pts;
 
-    AGAIN:
+AGAIN:
     r = net_recv_all(sock, header, HEADER_SIZE);
     if (r != HEADER_SIZE) {
-        elog("read header timeout/error: got %ld expected %ld", r, HEADER_SIZE);
+        elog("read header timeout/error: got %ld expected %ld", r, (long)HEADER_SIZE);
         return NULL;
     }
 
     pts = buffer_read64be(header);
     len = buffer_read32be(&header[8]);
-    // dlog("read_frame: header: pts=%llu len=%ld", pts, len);
 
     if (len == NO_PTS) {
         elog("stop/error from app side");
@@ -208,15 +197,14 @@ read_frame(Decoder *decoder, socket_t sock, int *has_config)
         return NULL;
     }
 
-    // no pts = config packet
     if (pts == NO_PTS) {
         if (config_len != 0) {
-             elog("double config ???");
+             elog("double config");
              return NULL;
         }
 
         if (len > MAXCONFIG) {
-            elog("read_frame: config packet too large at %ld!", len);
+            elog("read_frame: config packet too large at %ld", len);
             return NULL;
         }
 
@@ -251,6 +239,83 @@ read_frame(Decoder *decoder, socket_t sock, int *has_config)
     return data_packet;
 }
 
+static enum AVPixelFormat frame_pix_fmt(enum video_format format) {
+    switch (format) {
+        case VIDEO_FORMAT_I420: return AV_PIX_FMT_YUV420P;
+        case VIDEO_FORMAT_NV12: return AV_PIX_FMT_NV12;
+        case VIDEO_FORMAT_YUY2: return AV_PIX_FMT_YUYV422;
+        case VIDEO_FORMAT_UYVY: return AV_PIX_FMT_UYVY422;
+        case VIDEO_FORMAT_I422: return AV_PIX_FMT_YUV422P;
+        case VIDEO_FORMAT_I010: return AV_PIX_FMT_YUV420P10LE;
+        case VIDEO_FORMAT_P010: return AV_PIX_FMT_P010LE;
+        case VIDEO_FORMAT_I210: return AV_PIX_FMT_YUV422P10LE;
+        default: return AV_PIX_FMT_NONE;
+    }
+}
+
+static bool frame_to_bgr(droidcam_obs_source *plugin, const struct obs_source_frame2 *frame) {
+    enum AVPixelFormat src_fmt = frame_pix_fmt(frame->format);
+    if (src_fmt == AV_PIX_FMT_NONE)
+        return false;
+
+    size_t needed = (size_t)frame->width * frame->height * 3;
+    if (plugin->bgr_frame_size < needed) {
+        plugin->bgr_frame = (uint8_t *)brealloc(plugin->bgr_frame, needed);
+        plugin->bgr_frame_size = needed;
+    }
+
+    if (!plugin->bgr_frame)
+        return false;
+
+    if (!plugin->to_bgr || plugin->to_bgr_format != frame->format
+            || plugin->to_bgr_width != (int)frame->width
+            || plugin->to_bgr_height != (int)frame->height) {
+        if (plugin->to_bgr)
+            sws_freeContext(plugin->to_bgr);
+
+        plugin->to_bgr = sws_getContext(frame->width, frame->height, src_fmt,
+            frame->width, frame->height, AV_PIX_FMT_BGR24,
+            SWS_FAST_BILINEAR, NULL, NULL, NULL);
+        plugin->to_bgr_format = frame->format;
+        plugin->to_bgr_width = frame->width;
+        plugin->to_bgr_height = frame->height;
+    }
+
+    if (!plugin->to_bgr)
+        return false;
+
+    uint8_t *dst_data[4] = { plugin->bgr_frame, NULL, NULL, NULL };
+    int dst_linesize[4] = { (int)frame->width * 3, 0, 0, 0 };
+    const uint8_t *src_data[4] = {
+        frame->data[0], frame->data[1], frame->data[2], frame->data[3]
+    };
+    int src_linesize[4] = {
+        (int)frame->linesize[0], (int)frame->linesize[1],
+        (int)frame->linesize[2], (int)frame->linesize[3]
+    };
+
+    return sws_scale(plugin->to_bgr, src_data, src_linesize, 0, frame->height,
+        dst_data, dst_linesize) > 0;
+}
+
+static bool push_video_frame(droidcam_obs_source *plugin, const struct obs_source_frame2 *frame, uint64_t pts) {
+    if (!plugin->encoder || plugin->video_width != (int)frame->width || plugin->video_height != (int)frame->height) {
+        if (plugin->encoder)
+            encoder_rtsp_close(plugin->encoder);
+
+        plugin->video_width = frame->width;
+        plugin->video_height = frame->height;
+        plugin->encoder = encoder_rtsp_init(plugin->rtsp_url, plugin->video_width, plugin->video_height, plugin->fps);
+        if (!plugin->encoder)
+            return false;
+    }
+
+    if (!frame_to_bgr(plugin, frame))
+        return false;
+
+    return encoder_rtsp_encode_frame(plugin->encoder, plugin->bgr_frame, (int64_t)pts) >= 0;
+}
+
 static void *video_decode_thread(void *data) {
     droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
 
@@ -269,25 +334,20 @@ static void *video_decode_thread(void *data) {
         if (decoder->failed)
             goto LOOP;
 
-        if (!decoder->decode_video(&plugin->obs_video_frame, data_packet, &got_output)) {
+        if (!decoder->decode_video(&plugin->video_frame, data_packet, &got_output)) {
             elog("error decoding video");
             decoder->failed = true;
             goto LOOP;
         }
 
         if (got_output) {
-            plugin->obs_video_frame.timestamp = data_packet->pts * 1000;
-            //if (flip) plugin->obs_video_frame.flip = !plugin->obs_video_frame.flip;
-            #if 0
-            dlog("output video: %dx%d %lu",
-                plugin->obs_video_frame.width,
-                plugin->obs_video_frame.height,
-                plugin->obs_video_frame.timestamp);
-            #endif
-            obs_source_output_video2(plugin->source, &plugin->obs_video_frame);
+            plugin->video_frame.timestamp = data_packet->pts * 1000;
+            if (!push_video_frame(plugin, &plugin->video_frame, data_packet->pts)) {
+                elog("error pushing encoded RTSP frame");
+            }
         }
 
-        LOOP:
+LOOP:
         decoder->push_empty_packet(data_packet);
     }
 
@@ -304,8 +364,7 @@ recv_video_frame(droidcam_obs_source *plugin, socket_t sock) {
     if (!decoder) {
         if (plugin->video_format == FORMAT_MJPG) {
             decoder = new MJpegDecoder();
-        }
-        else {
+        } else {
             decoder = new FFMpegDecoder();
         }
         plugin->video_decoder = decoder;
@@ -315,17 +374,12 @@ recv_video_frame(droidcam_obs_source *plugin, socket_t sock) {
     if (!data_packet)
         return false;
 
-    // NOTE: data_packet must be properly disposed from here
-
-    // Decoder failures should not happen generally.
-    // Rather than causing a connection reset, just idle
     if (decoder->failed) {
-        FAILED:
-        dlog("discarding frame.. decoder failed");
+FAILED:
+        dlog("discarding frame; decoder failed");
         decoder->push_empty_packet(data_packet);
         return true;
     }
-
 
     if (!decoder->ready) {
         bool init = false;
@@ -334,72 +388,71 @@ recv_video_frame(droidcam_obs_source *plugin, socket_t sock) {
 
         if (plugin->video_format == FORMAT_AVC) {
             init = (((FFMpegDecoder*)decoder)->init(NULL, AV_CODEC_ID_H264, use_hw) >= 0);
-        }
-        else if (plugin->video_format == FORMAT_HEVC) {
+        } else if (plugin->video_format == FORMAT_HEVC) {
             init = (((FFMpegDecoder*)decoder)->init(NULL, AV_CODEC_ID_H265, use_hw) >= 0);
-        }
-        else if (plugin->video_format == FORMAT_MJPG) {
+        } else if (plugin->video_format == FORMAT_MJPG) {
             init = ((MJpegDecoder*)decoder)->init();
-        }
-        else {
+        } else {
             init = false;
         }
 
-        plugin->obs_video_frame.format = VIDEO_FORMAT_NONE;
-        plugin->obs_video_frame.range  = VIDEO_RANGE_DEFAULT;
-        if (init) {
-            comms_task(CommsTask::TALLY);
-            droidcam_signal(plugin->source, "droidcam_connect");
-        } else {
+        plugin->video_frame.format = VIDEO_FORMAT_NONE;
+        plugin->video_frame.range  = VIDEO_RANGE_DEFAULT;
+        if (!init) {
             elog("could not initialize decoder");
             decoder->failed = true;
             goto FAILED;
         }
+        ilog("decoder initialized");
     }
 
     decoder->push_ready_packet(data_packet);
     return true;
 }
 
+static void release_decoder(droidcam_obs_source *plugin) {
+    if (!plugin->video_decoder)
+        return;
+
+    while (plugin->video_decoder->recieveQueue.items.size() < plugin->video_decoder->alloc_count
+            && SOURCE_EXISTS()) {
+        dlog("waiting for decode thread: %lu/%lu",
+            plugin->video_decoder->recieveQueue.items.size(),
+            plugin->video_decoder->alloc_count);
+        os_sleep_ms(MILLI_SEC / FPS);
+    }
+
+    dlog("release video_decoder");
+    delete plugin->video_decoder;
+    plugin->video_decoder = NULL;
+}
+
 static void *video_thread(void *data) {
     droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    const char *obs_version_str = obs_get_version_string();
+    const char *client_version_str = PLUGIN_VERSION_STR;
+    const char *obs_version_str = "standalone";
     socket_t sock = INVALID_SOCKET;
-    char remote_url[256];
     char video_req[256];
     int video_req_len = 0;
 
-    #if DROIDCAM_OVERRIDE
-    // todo: dont do this
-    char client_version_str[4];
-    client_version_str[0] = obs_version_str[0];
-    client_version_str[1] = obs_version_str[2];
-    client_version_str[2] = obs_version_str[4];
-    client_version_str[3] = 0;
-    #endif
-
-
     ilog("video_thread start");
 
-    // Preload devices if plugin is created already active
-    // (ex. when obs is re-launched)
-    // This saves an unnecessary initial SLOW_LOOP
     if (plugin->activated) {
         switch (plugin->device_info.type) {
-            case DeviceType::MDNS:
+            case MDNS:
                 plugin->mdnsMgr.Reload();
                 plugin->mdnsMgr.ResetIter();
                 break;
-            case DeviceType::ADB:
+            case ADB:
                 plugin->adbMgr.Reload();
                 plugin->adbMgr.ResetIter();
                 break;
-            case DeviceType::IOS:
+            case IOS:
                 plugin->iosMgr.Reload();
                 plugin->iosMgr.ResetIter();
                 break;
-            case DeviceType::WIFI:
-            case DeviceType::NONE:
+            case WIFI:
+            case NONE:
                 break;
         }
     }
@@ -407,10 +460,10 @@ static void *video_thread(void *data) {
     while (SOURCE_EXISTS()) {
         if (plugin->activated && plugin->is_showing) {
             if (plugin->video_running) {
-                if (os_event_try(plugin->reset_signal) == EAGAIN
-                    && recv_video_frame(plugin, sock))
+                if (!plugin->reset_requested && recv_video_frame(plugin, sock))
                     continue;
 
+                plugin->reset_requested = false;
                 plugin->video_running = false;
                 dlog("closing failed video socket %d", sock);
                 net_close(sock);
@@ -418,7 +471,7 @@ static void *video_thread(void *data) {
                 goto SLOW_LOOP;
             }
 
-            if ((sock = connect(plugin)) == INVALID_SOCKET)
+            if ((sock = connect_device(plugin)) == INVALID_SOCKET)
                 goto SLOW_LOOP;
 
             video_req_len = snprintf(video_req, sizeof(video_req), VIDEO_REQ,
@@ -426,13 +479,9 @@ static void *video_thread(void *data) {
                 plugin->video_width, plugin->video_height,
                 plugin->usb_port,
                 os_name_version,
-                #if DROIDCAM_OVERRIDE
-                ""/*obs_version_str*/, client_version_str, 0/*use_hdr*/,
-                #else
-                obs_version_str, PLUGIN_VERSION_STR,
+                obs_version_str, client_version_str,
                 (plugin->use_hdr && plugin->video_format == FORMAT_HEVC),
-                #endif
-                5912/*NONCE*/);
+                5912);
 
             dlog("%s", video_req);
             if (net_send_all(sock, video_req, video_req_len) <= 0) {
@@ -440,7 +489,7 @@ static void *video_thread(void *data) {
                 net_close(sock);
                 sock = INVALID_SOCKET;
 
-                SLOW_LOOP:
+SLOW_LOOP:
                 os_sleep_ms(MILLI_SEC * 2);
                 goto LOOP;
             }
@@ -448,26 +497,12 @@ static void *video_thread(void *data) {
             set_recv_buf_len(sock, 65536 * 4);
             plugin->video_running = true;
             dlog("starting video via socket %d", sock);
-
-            int port = (plugin->device_info.type == DeviceType::ADB
-                    || plugin->device_info.type == DeviceType::IOS)
-                ? plugin->usb_port
-                : plugin->device_info.port;
-
-            if (port > 0) {
-                snprintf(remote_url, sizeof(remote_url), "http://%s:%d", plugin->device_info.ip, port);
-                obs_data_t *settings = obs_source_get_settings(plugin->source);
-                obs_data_set_string(settings, "remote_url", remote_url);
-                obs_data_release(settings);
-            }
-
-            os_event_reset(plugin->reset_signal);
             continue;
         }
-        // else: not activated
+
         video_req_len = 0;
 
-        LOOP:
+LOOP:
         if (plugin->video_running) {
             plugin->video_running = false;
         }
@@ -478,25 +513,7 @@ static void *video_thread(void *data) {
             sock = INVALID_SOCKET;
         }
 
-        if (plugin->video_decoder) {
-            if (plugin->video_decoder->ready)
-                droidcam_signal(plugin->source, "droidcam_disconnect");
-
-            while (plugin->video_decoder->recieveQueue.items.size() < plugin->video_decoder->alloc_count
-                    && SOURCE_EXISTS())
-            {
-                dlog("waiting for decode thread: %lu/%lu",
-                    plugin->video_decoder->recieveQueue.items.size(),
-                    plugin->video_decoder->alloc_count);
-                os_sleep_ms(MILLI_SEC / FPS);
-            }
-
-            dlog("release video_decoder");
-            delete plugin->video_decoder;
-            plugin->video_decoder = NULL;
-        }
-
-        obs_source_output_video2(plugin->source, NULL);
+        release_decoder(plugin);
         os_sleep_ms(MILLI_SEC / FPS);
     }
 
@@ -506,929 +523,61 @@ static void *video_thread(void *data) {
     return NULL;
 }
 
-static bool
-do_audio_frame(droidcam_obs_source *plugin, socket_t sock) {
-    FFMpegDecoder *decoder = (FFMpegDecoder*)plugin->audio_decoder;
-    if (!decoder) {
-        dlog("create audio decoder");
-        decoder = new FFMpegDecoder();
-        plugin->audio_decoder = decoder;
-    }
-
-    int has_config = 0;
-    bool got_output;
-    DataPacket* data_packet = read_frame(decoder, sock, &has_config);
-    if (!data_packet)
-        return false;
-
-    // NOTE: data_packet must be properly disposed from here
-
-    // Decoder failures should not happen generally.
-    // Rather than causing a connection reset, just idle
-    if (decoder->failed) {
-        FAILED:
-        dlog("discarding audio frame.. decoder failed");
-        decoder->push_empty_packet(data_packet);
-        return true;
-    }
-
-    if (has_config || !decoder->ready) {
-        if (decoder->ready) {
-            ilog("unexpected audio config change while decoder is init'd");
-            decoder->failed = true;
-            goto FAILED;
-        }
-
-        if (decoder->init(data_packet->data, AV_CODEC_ID_AAC, false) < 0) {
-            elog("could not initialize AAC decoder");
-            decoder->failed = true;
-            goto FAILED;
-        }
-
-        plugin->obs_audio_frame.format = AUDIO_FORMAT_UNKNOWN;
-        decoder->push_empty_packet(data_packet);
-        return true;
-    }
-
-
-    // decoder->push_ready_packet(data_packet);
-    if (!decoder->decode_audio(&plugin->obs_audio_frame, data_packet, &got_output)) {
-        elog("error decoding audio");
-        decoder->failed = true;
-        goto FAILED;
-    }
-
-    if (got_output) {
-        plugin->obs_audio_frame.timestamp = os_gettime_ns(); // data_packet->pts * 1000;
-        #if 0
-        dlog("output audio: %d frames: %d HZ, Fmt %d, Chan %d,  pts %lu",
-            plugin->obs_audio_frame.frames,
-            plugin->obs_audio_frame.samples_per_sec,
-            plugin->obs_audio_frame.format,
-            plugin->obs_audio_frame.speakers,
-            plugin->obs_audio_frame.timestamp);
-        #endif
-        obs_source_output_audio(plugin->source, &plugin->obs_audio_frame);
-    }
-
-    decoder->push_empty_packet(data_packet);
-    return true;
-}
-
-static void *audio_thread(void *data) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    socket_t sock = INVALID_SOCKET;
-    const char *audio_req = AUDIO_REQ;
-
-    ilog("audio_thread start");
-    while (SOURCE_EXISTS()) {
-        if (plugin->activated && plugin->is_showing && plugin->enable_audio) {
-            if (plugin->audio_running) {
-                if (do_audio_frame(plugin, sock)) {
-                    continue;
-                }
-
-                plugin->audio_running = false;
-                dlog("closing failed audio socket %d", sock);
-                net_close(sock);
-                sock = INVALID_SOCKET;
-                goto SLOW_LOOP;
-            }
-
-            // connect audio only after video works
-            if (!plugin->video_running)
-                goto LOOP;
-
-            // no rush..
-            os_sleep_ms(MILLI_SEC);
-
-            if ((sock = connect(plugin)) == INVALID_SOCKET)
-                goto SLOW_LOOP;
-
-            if (net_send_all(sock, audio_req, sizeof(AUDIO_REQ)-1) <= 0) {
-                elog("send(/audio) failed");
-                net_close(sock);
-                sock = INVALID_SOCKET;
-
-                SLOW_LOOP:
-                os_sleep_ms(MILLI_SEC * 2);
-                goto LOOP;
-            }
-
-            plugin->audio_running = true;
-            dlog("starting audio via socket %d", sock);
-            continue;
-        }
-
-        // else: not activated
-        if (plugin->audio_running) {
-            plugin->audio_running = false;
-        }
-
-        LOOP:
-        if (sock != INVALID_SOCKET) {
-            dlog("closing active audio socket %d", sock);
-            net_close(sock);
-            sock = INVALID_SOCKET;
-        }
-
-        if (plugin->audio_decoder) {
-            dlog("release audio_decoder");
-            delete plugin->audio_decoder;
-            plugin->audio_decoder = NULL;
-        }
-
-        if (plugin->enable_audio) obs_source_output_audio(plugin->source, NULL);
-        os_sleep_ms(MILLI_SEC / FPS);
-    }
-
-    ilog("audio_thread end");
-    plugin->audio_running = false;
-    if (sock != INVALID_SOCKET) net_close(sock);
-    return NULL;
-}
-
-static int
-basic_http(socket_t sock, char* buf, const size_t maxlen, const char *request, const size_t len) {
-    if (net_send_all(sock, request, len) <= 0) {
-        return 0;
-    }
-
-    memset(buf, 0, maxlen);
-    int i = 0;
-    while (i < maxlen) {
-        int rc = net_recv(sock, &buf[i], maxlen - i);
-        if (rc > 0) {
-            i += rc;
-            continue;
-        }
-
-        #if _WIN32
-        WSAErrno();
-        if (rc < 0 && (errno == WSAEWOULDBLOCK || errno == WSAETIMEDOUT))
-            break;
-
-        #else
-        if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS))
-            break;
-
-        #endif
-
-        return 0;
-    }
-
-    for (i = 0; i < maxlen; i++) {
-        if (!(buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n'))
-            continue;
-
-        return i+4;
-    }
-
-    return 0;
-}
-
-static void *comms_thread(void *data) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    socket_t sock = INVALID_SOCKET;
-    char buf[4096] = {0};
-    const size_t maxlen = sizeof(buf) - 4;
-
-    #if DROIDCAM_OVERRIDE
-    const char *battery_req = BATT_REQ;
-    const int WARN = 15;
-    int prevBattery = 100;
-    #endif /* DROIDCAM_OVERRIDE */
-
-    int event = 0;
-
-    dlog("comms_thread start");
-
-    while ((event = os_event_timedwait(plugin->comms_signal, (30*MILLI_SEC))) != EINVAL
-        && SOURCE_EXISTS())
-    {
-        os_event_reset(plugin->comms_signal);
-
-        if (plugin->activated && plugin->video_running) {
-
-            if (sock == INVALID_SOCKET) {
-                if ((sock = connect(plugin)) == INVALID_SOCKET)
-                    continue;
-                set_recv_timeout(sock, 1);
-            }
-        }
-        else {
-            if (sock != INVALID_SOCKET) {
-                #if DROIDCAM_OVERRIDE
-                prevBattery = 100;
-                buf[0] = 0;
-                signal_source_update(plugin->source, (const char*) &buf[0], 0);
-                #endif
-
-                CLOSE:
-                dlog("closing comms socket %d // (%d) %s", sock, errno, strerror(errno));
-                net_close(sock);
-                sock = INVALID_SOCKET;
-            }
-        }
-
-        if (sock == INVALID_SOCKET)
-            continue;
-
-        if (event == ETIMEDOUT) {
-            #if DROIDCAM_OVERRIDE
-            int i = basic_http(sock, buf, maxlen, battery_req, sizeof(BATT_REQ) - 1);
-            if (i > 0) {
-                int start = i;
-                for (; i < maxlen && isdigit(buf[i]); i++);
-
-                if (i > start) {
-                    buf[i++] = '%';
-                    buf[i  ] = 0;
-
-                    const char* value = (const char*) &buf[start];
-                    i = atoi(value);
-                    const int alert = (prevBattery > WARN && i <= WARN);
-                    dlog("battery %d -> %d (%s) alert=%d", prevBattery, i, value, alert);
-                    signal_source_update(plugin->source, value, alert);
-                    prevBattery = i;
-                }
-            }
-            else goto CLOSE;
-
-            #endif // DROIDCAM_OVERRIDE
-        }
-
-        CommsTask task;
-        const char *tally = NULL;
-
-        while ((task = plugin->comms_queue.next_item()) != CommsTask::NONE) {
-            if (task == CommsTask::TALLY) {
-                // consume all tally events and send the latest one
-                if (plugin->tally.on_program) {
-                    tally = "program";
-                }
-                else if (plugin->tally.on_preview) {
-                    tally = "preview";
-                }
-                else {
-                    tally = "idle";
-                }
-                dlog("comms: task (%d) // %s", task, tally);
-            }
-        }
-
-        if (tally != NULL) {
-            int len = snprintf(buf, maxlen, TALLY_REQ, tally);
-            if (basic_http(sock, buf, maxlen, (const char*) &buf[0], len) > 0) {
-                dlog("comms: tally -> %s", tally);
-            }
-            else {
-                if (errno != 0) {
-                    // Try again if the request actually failed.
-                    // If there is no error, most likely the app closed the connection,
-                    // ie. tally is not supported (such as with old app versions).
-                    os_sleep_ms(MILLI_SEC * 5);
-                    comms_task(CommsTask::TALLY);
-                }
-                goto CLOSE;
-            }
-        }
-    } // while (SOURCE_EXISTS)
-
-    if (sock != INVALID_SOCKET) net_close(sock);
-
-    dlog("comms_thread end");
-    return NULL;
-}
-
-void source_destroy(void *data) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    ilog("destroy: \"%s\"", obs_source_get_name(plugin->source));
-
-    if (plugin) {
-        if (plugin->time_start != 0) {
-            ilog("stopping");
-            os_event_signal(plugin->stop_signal);
-            pthread_join(plugin->video_thread, NULL);
-            pthread_join(plugin->audio_thread, NULL);
-
-            os_event_signal(plugin->comms_signal);
-            pthread_join(plugin->comms_thread, NULL);
-            pthread_join(plugin->video_decode_thread, NULL);
-
-            os_event_destroy(plugin->stop_signal);
-            os_event_destroy(plugin->reset_signal);
-            os_event_destroy(plugin->comms_signal);
-        }
-
-        ilog("cleanup");
-        if (plugin->video_decoder) delete plugin->video_decoder;
-        if (plugin->audio_decoder) delete plugin->audio_decoder;
-        delete plugin;
-    }
-}
-
-#if DROIDCAM_OVERRIDE
-static const char *droidcam_signals[] = {
-    "void droidcam_source_status(in out int status)",
-    "void droidcam_source_context(in out ptr context)",
-    "void droidcam_source_update(string battery)",
-    NULL,
-};
-#endif
-
-static void settings_migration(obs_data_t *settings, droidcam_obs_source *plugin) {
-    // v2.3.4 (jan/2025)
-    const char* opt_resolution = "resolution";
-    int video_resolution_int = obs_data_get_int(settings, opt_resolution);
-    if (video_resolution_int > 0 && video_resolution_int < ARRAY_LEN(Resolutions)) {
-        dlog("### settings_migration: Resolutions[%d] => string %s", video_resolution_int, Resolutions[video_resolution_int]);
-        obs_data_set_string(settings, OPT_RESOLUTION_STR, Resolutions[video_resolution_int]);
-        obs_data_set_int(settings, opt_resolution, 0);
-    }
-}
-
-void *source_create(obs_data_t *settings, obs_source_t *source) {
-    ilog("Source: \"%s\" - " PLUGIN_VERSION_STR, obs_source_get_name(source));
+void *droidcam_source_start(const struct droidcam_source_config *config) {
     droidcam_obs_source *plugin = new droidcam_obs_source();
-    settings_migration(settings, plugin);
 
-    plugin->source = source;
-    plugin->audio_running = false;
-    plugin->video_running = false;
-    plugin->audio_decoder = NULL;
-    plugin->video_decoder = NULL;
-    plugin->usb_port = 0;
-    plugin->use_hw = obs_data_get_bool(settings, OPT_USE_HW_ACCEL);
-    plugin->use_hdr = obs_data_get_bool(settings, OPT_USE_HDR);
-    plugin->video_format = (VideoFormat) obs_data_get_int(settings, OPT_VIDEO_FORMAT);
-    plugin->enable_audio  = obs_data_get_bool(settings, OPT_ENABLE_AUDIO);
-    plugin->deactivateWNS = obs_data_get_bool(settings, OPT_DEACTIVATE_WNS);
-    plugin->activated = obs_data_get_bool(settings, OPT_IS_ACTIVATED);
-    obs_source_set_async_unbuffered(source, obs_data_get_bool(settings, OPT_UNBUFFERED_OUT));
-    obs_data_set_string(settings, "remote_url", "");
+    plugin->activated = true;
+    plugin->is_showing = true;
+    plugin->use_hw = config->use_hw;
+    plugin->use_hdr = config->use_hdr;
+    plugin->video_width = config->width;
+    plugin->video_height = config->height;
+    plugin->fps = config->fps > 0 ? config->fps : FPS;
+    plugin->video_format = config->video_format;
+    plugin->device_info.type = WIFI;
+    plugin->device_info.id = config->device_id ? config->device_id : config->device_ip;
+    plugin->device_info.ip = config->device_ip;
+    plugin->device_info.port = config->port;
+    plugin->rtsp_url = strdup(config->rtsp_url);
 
-    const char* video_resolution = obs_data_get_string(settings, OPT_RESOLUTION_STR);
-    if (!ResolutionValid(video_resolution, &plugin->video_width, &plugin->video_height)) {
-        obs_data_set_string(settings, OPT_RESOLUTION_STR, Resolutions[0]);
-        if (!ConvertRes(Resolutions[0], &plugin->video_width, &plugin->video_height)) {
-            plugin->video_width  = 1280;
-            plugin->video_height = 720;
-        }
-    }
-
-    #if DROIDCAM_OVERRIDE
-    plugin->deactivateWNS = true;
-    signal_handler_t *h = obs_source_get_signal_handler(source);
-    signal_handler_add_array(h, droidcam_signals);
-
-    plugin->signal_handlers.emplace_back(h, "droidcam_source_status",
-        [](void *data, calldata_t *cd) {
-            droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-            int status = 0;
-            if (plugin->activated)     status |= 1;
-            if (plugin->video_running) status |= 2;
-            if (plugin->audio_running) status |= 4;
-            calldata_set_int(cd, "status", status);
-        }, plugin);
-
-    plugin->signal_handlers.emplace_back(h, "droidcam_source_context",
-        [](void *data, calldata_t *cd) {
-            calldata_set_ptr(cd, "context", data);
-        }, plugin);
-
-    #endif
-
-    ilog("Source: activated=%d, deactivateWNS=%d, is_showing=%d, enable_audio=%d",
-        plugin->activated, plugin->deactivateWNS, plugin->is_showing, plugin->enable_audio);
-    ilog("Source: video_format=%s video_resolution=%dx%d",
+    ilog("Source: video_format=%s video_resolution=%dx%d rtsp=%s",
         VideoFormatNames[plugin->video_format][1],
-        plugin->video_width, plugin->video_height);
-
-    // dummy source, do not create threads & decoders
-    if (obs_data_get_bool(settings, OPT_DUMMY_SOURCE)) {
-        dlog("dummy source created");
-        plugin->time_start = 0;
-        return plugin;
-    }
-
-    if (plugin->activated) {
-        plugin->device_info.id = obs_data_get_string(settings, OPT_ACTIVE_DEV_ID);
-        plugin->device_info.ip = obs_data_get_string(settings, OPT_ACTIVE_DEV_IP);
-        plugin->device_info.port = (int) obs_data_get_int(settings, OPT_APP_PORT);
-        plugin->device_info.type = (DeviceType) obs_data_get_int(settings, OPT_ACTIVE_DEV_TYPE);
-        ilog("activated: device_info.id=%s device_info.ip=%s device_info.port=%d device_info.type=%d",
-            plugin->device_info.id, plugin->device_info.ip,
-            plugin->device_info.port, (int) plugin->device_info.type);
-
-        if (plugin->device_info.type == DeviceType::NONE
-            || plugin->device_info.port <= 0 || plugin->device_info.port > 65535
-            || !plugin->device_info.id || plugin->device_info.id[0] == 0)
-            plugin->activated = false;
-
-        if (plugin->device_info.type == DeviceType::WIFI && (!plugin->device_info.ip || plugin->device_info.ip[0] == 0))
-            plugin->activated = false;
-
-        // Not sure if this is a bug or a feature.
-        // Launching while activated & hidden will not start video until visibility is toggled.
-        //
-        // activated=1, deactivateWNS=0, is_showing=0, enable_audio=0
-        //
-        // if (plugin->activated || !plugin->deactivateWNS)
-        //     plugin->is_showing = true;
-    }
-
-    if (os_event_init(&plugin->stop_signal, OS_EVENT_TYPE_MANUAL) != 0) {
-        source_destroy(plugin);
-        return NULL;
-    }
-
-    if (os_event_init(&plugin->reset_signal, OS_EVENT_TYPE_MANUAL) != 0) {
-        source_destroy(plugin);
-        return NULL;
-    }
-
-    if (os_event_init(&plugin->comms_signal, OS_EVENT_TYPE_MANUAL) != 0) {
-        source_destroy(plugin);
-        return NULL;
-    }
+        plugin->video_width, plugin->video_height, plugin->rtsp_url);
 
     if (pthread_create(&plugin->video_thread, NULL, video_thread, plugin) != 0) {
-        source_destroy(plugin);
+        droidcam_source_stop(plugin);
         return NULL;
     }
 
     if (pthread_create(&plugin->video_decode_thread, NULL, video_decode_thread, plugin) != 0) {
-        source_destroy(plugin);
+        droidcam_source_stop(plugin);
         return NULL;
     }
 
-    if (pthread_create(&plugin->comms_thread, NULL, comms_thread, plugin) != 0) {
-        source_destroy(plugin);
-        return NULL;
-    }
-
-    if (pthread_create(&plugin->audio_thread, NULL, audio_thread, plugin) != 0) {
-        source_destroy(plugin);
-        return NULL;
-    }
-
-    plugin->time_start = os_gettime_ns() / 100;
     return plugin;
 }
 
-void source_show(void *data) {
+void droidcam_source_stop(void *data) {
     droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    plugin->is_showing = true;
-
-    #if defined(ENABLE_GUI) && LIBOBS_API_MAJOR_VER > 27
-    obs_source_t *scene = obs_frontend_get_current_scene();
-    if (scene) {
-        obs_scene_enum_items(obs_scene_from_source(scene),
-            [](obs_scene_t*, obs_sceneitem_t *item, void *data) {
-            obs_source_t* source = (obs_source_t*) data;
-            if (obs_sceneitem_get_source(item) == source) {
-                vec2 pos;
-                vec2 scale;
-                struct obs_sceneitem_crop crop;
-                obs_sceneitem_get_pos(item, &pos);
-                obs_sceneitem_get_crop(item, &crop);
-                obs_sceneitem_get_scale(item, &scale);
-                ilog("pos:%.0f,%.0f scale:%.1f,%.1f rot:%.1f crop:%d,%d; %d,%d",
-                    pos.x, pos.y, scale.x, scale.y,
-                    obs_sceneitem_get_rot(item),
-                    crop.left, crop.top, crop.right, crop.bottom);
-
-                return false; // stop enumeration
-            }
-            return true;
-        }, plugin->source);
-
-        obs_source_release(scene);
-    }
-    #endif
-
-    plugin->tally.on_preview = true;
-    comms_task(CommsTask::TALLY);
-    dlog("source_show: is_showing=%d", plugin->is_showing);
-}
-
-void source_hide(void *data) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    if (plugin->deactivateWNS && plugin->activated)
-        plugin->is_showing = false;
-
-    plugin->tally.on_preview = false;
-    comms_task(CommsTask::TALLY);
-    dlog("source_hide: is_showing=%d", plugin->is_showing);
-}
-
-void source_show_main(void *data) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    plugin->tally.on_program = true;
-    comms_task(CommsTask::TALLY);
-}
-
-void source_hide_main(void *data) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    plugin->tally.on_program = false;
-    comms_task(CommsTask::TALLY);
-}
-
-static inline void toggle_ppts(obs_properties_t *ppts, bool enable) {
-    obs_property_set_enabled(obs_properties_get(ppts, OPT_REFRESH)     , enable);
-    obs_property_set_enabled(obs_properties_get(ppts, OPT_DEVICE_LIST) , enable);
-    obs_property_set_enabled(obs_properties_get(ppts, OPT_WIFI_IP)     , enable);
-    obs_property_set_enabled(obs_properties_get(ppts, OPT_APP_PORT)    , enable);
-    obs_property_set_enabled(obs_properties_get(ppts, OPT_ENABLE_AUDIO), enable);
-    obs_property_set_enabled(obs_properties_get(ppts, OPT_USE_HW_ACCEL), enable);
-    obs_property_set_enabled(obs_properties_get(ppts, OPT_USE_HDR)     , enable);
-}
-
-void resolve_device_type(struct active_device_info *device_info, void* data) {
-    if (!device_info || !data)
+    if (!plugin)
         return;
 
-    const char *id = device_info->id;
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
+    ilog("stopping");
+    plugin->stop_requested = true;
 
-    Device* dev;
-    AdbMgr* adbMgr = &plugin->adbMgr;
-    USBMux* iosMgr = &plugin->iosMgr;
-    MDNS  *mdnsMgr = &plugin->mdnsMgr;
+    if (plugin->video_thread)
+        pthread_join(plugin->video_thread, NULL);
+    if (plugin->video_decode_thread)
+        pthread_join(plugin->video_decode_thread, NULL);
 
-    dev = mdnsMgr->GetDevice(id);
-    if (dev) {
-        device_info->ip = dev->address;
-        device_info->type = DeviceType::MDNS;
-        return;
-    }
+    release_decoder(plugin);
 
-    dev = adbMgr->GetDevice(id);
-    if (dev) {
-        if (adbMgr->DeviceOffline(dev)) {
-            elog("adb device is offline");
-            goto out;
-        }
-
-        device_info->ip = localhost_ip;
-        device_info->type = DeviceType::ADB;
-        return;
-    }
-
-    dev = iosMgr->GetDevice(id);
-    if (dev) {
-        device_info->ip = localhost_ip;
-        device_info->type = DeviceType::IOS;
-        return;
-    }
-
-    out:
-    device_info->type = DeviceType::NONE;
-    return;
-}
-
-static bool video_parms_changed(void *data, obs_properties_t*, obs_property_t*,
-                 obs_data_t *settings) {
-
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-
-    const char* video_resolution = obs_data_get_string(settings, OPT_RESOLUTION_STR);
-    enum VideoFormat video_format = (VideoFormat) obs_data_get_int(settings, OPT_VIDEO_FORMAT);
-
-    int width, height;
-    if (!ResolutionValid(video_resolution, &width, &height))
-        return false;
-
-    if (width == plugin->video_width && height == plugin->video_height
-        && video_format == plugin->video_format)
-        return false;
-
-    ilog("video_parms_changed: video_format:%s->%s video_resolution:%dx%d->%dx%d",
-        VideoFormatNames[plugin->video_format][1], VideoFormatNames[video_format][1],
-        plugin->video_width, plugin->video_height, width, height);
-
-    plugin->video_width = width;
-    plugin->video_height = height;
-    plugin->video_format = video_format;
-    os_event_signal(plugin->reset_signal);
-    return false;
-}
-
-static bool connect_clicked(obs_properties_t *ppts, obs_property_t *p, void *data) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    struct active_device_info *device_info = &plugin->device_info;
-
-    obs_data_t *settings = obs_source_get_settings(plugin->source);
-    obs_property_t *cp = obs_properties_get(ppts, OPT_CONNECT);
-    obs_property_set_enabled(cp, false);
-
-    bool activated = obs_data_get_bool(settings, OPT_IS_ACTIVATED);
-    enum VideoFormat video_format = (VideoFormat) obs_data_get_int(settings, OPT_VIDEO_FORMAT);
-    const char* video_resolution = obs_data_get_string(settings, OPT_RESOLUTION_STR);
-
-    if (activated) {
-        plugin->usb_port = 0;
-        plugin->activated = false;
-        toggle_ppts(ppts, true);
-        obs_data_set_bool(settings, OPT_IS_ACTIVATED, false);
-        obs_property_set_description(cp, TEXT_CONNECT);
-        ilog("deactivate");
-        goto out;
-    }
-
-    int width, height;
-    if (!ResolutionValid(video_resolution, &width, &height)) {
-        elog("invalid resolution: %s", video_resolution);
-        #if ENABLE_GUI
-        QString title = QString(obs_module_text("DroidCam"));
-        QString msg = QString(obs_module_text("BadResolution"));
-        QMessageBox mb(QMessageBox::Information, title, msg,
-            QMessageBox::StandardButtons(QMessageBox::Ok), main_window);
-        mb.exec();
-        #endif
-        goto out;
-    }
-
-    if (video_format == FORMAT_MJPG && (width > 1920 || height > 1080)) {
-        elog("mjpg is limited to 1920x1080");
-        #if ENABLE_GUI
-        QString title = QString(obs_module_text("DroidCam"));
-        QString msg = QString(obs_module_text("MJPEGLimit"));
-        QMessageBox mb(QMessageBox::Information, title, msg,
-            QMessageBox::StandardButtons(QMessageBox::Ok), main_window);
-        mb.exec();
-        #endif
-        goto out;
-    }
-
-    device_info->type = DeviceType::NONE;
-    device_info->id = obs_data_get_string(settings, OPT_DEVICE_LIST);
-    if (!device_info->id || device_info->id[0] == 0){
-        elog("target device id is empty");
-        goto out;
-    }
-
-    device_info->port = (int) obs_data_get_int(settings, OPT_APP_PORT);
-    if (device_info->port <= 0 || device_info->port > 65535) {
-        elog("invalid port: %d", device_info->port);
-        goto out;
-    }
-
-    if (strncmp(device_info->id, opt_use_wifi, strlen(opt_use_wifi)) == 0) {
-        device_info->ip = obs_data_get_string(settings, OPT_WIFI_IP);
-        if (!device_info->ip || device_info->ip[0] == 0) {
-            elog("target IP is empty");
-
-            #if ENABLE_GUI
-            QString title = QString(obs_module_text("DroidCam"));
-            QString msg = QString(obs_module_text("NoWifiIP"));
-            QMessageBox mb(QMessageBox::Information, title, msg,
-                QMessageBox::StandardButtons(QMessageBox::Ok), main_window);
-            mb.exec();
-            #endif
-
-            goto out;
-        }
-
-        ilog("target IP is '%s'", device_info->ip);
-        device_info->type = DeviceType::WIFI;
-        #if DROIDCAM_OVERRIDE==0
-        if (   (device_info->ip[0] == '4')
-            && (device_info->ip[1] == 'k' || device_info->ip[1] == 'K')
-            && (device_info->ip[2] == '\0'))
-        {
-            obs_data_set_bool(settings, OPT_UHD_UNLOCK, true);
-            obs_data_set_string(settings, OPT_WIFI_IP, "");
-
-            #if ENABLE_GUI
-            QString title = QString(obs_module_text("DroidCam"));
-            QString msg = QString(obs_module_text("UHDUnlocked"));
-            QMessageBox mb(QMessageBox::Information, title, msg,
-                QMessageBox::StandardButtons(QMessageBox::Ok), main_window);
-            mb.exec();
-            #endif
-
-            goto out;
-        }
-        #endif
-    }
-    else {
-        resolve_device_type(device_info, data);
-    }
-
-    if (device_info->type == DeviceType::NONE) {
-        elog("unable to determine devce type, refresh device list and try again");
-        goto out;
-    }
-
-    obs_property_set_description(cp, TEXT_DEACTIVATE);
-    plugin->video_format = video_format;
-    plugin->video_width = width;
-    plugin->video_height = height;
-
-    toggle_ppts(ppts, false);
-    obs_data_set_string(settings, OPT_ACTIVE_DEV_ID, device_info->id);
-    obs_data_set_string(settings, OPT_ACTIVE_DEV_IP, device_info->ip);
-    obs_data_set_int(settings, OPT_ACTIVE_DEV_TYPE, (long long) device_info->type);
-    obs_data_set_bool(settings, OPT_IS_ACTIVATED, true);
-    plugin->activated = true;
-    ilog("activated: id=%s type=%d ip=%s port=%d", device_info->id, (int)device_info->type, device_info->ip, device_info->port);
-    ilog("video_format=%s video_resolution=%dx%d", VideoFormatNames[plugin->video_format][1], plugin->video_width, plugin->video_height);
-
-    out:
-    obs_property_set_enabled(cp, true);
-    if (settings) obs_data_release(settings);
-    return true;
-}
-
-static bool refresh_clicked(obs_properties_t *ppts, obs_property_t *p, void *data) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    Device* dev;
-    AdbMgr *adbMgr = &plugin->adbMgr;
-    USBMux* iosMgr = &plugin->iosMgr;
-    MDNS  *mdnsMgr = &plugin->mdnsMgr;
-    obs_property_t *cp = obs_properties_get(ppts, OPT_CONNECT);
-    obs_property_set_enabled(cp, false);
-
-    if (plugin->time_start == 0) {
-        // dummy mode
-        ilog("ReLoading Device List...");
-    }
-    else {
-        ilog("Refresh Device List clicked");
-    }
-
-    mdnsMgr->Reload();
-    adbMgr->Reload();
-    iosMgr->Reload();
-
-    p = obs_properties_get(ppts, OPT_DEVICE_LIST);
-    obs_property_list_clear(p);
-
-    adbMgr->ResetIter();
-    while ((dev = adbMgr->NextDevice()) != NULL) {
-        adbMgr->GetModel(dev);
-        char *label = dev->model[0] != 0 ? dev->model : dev->serial;
-        dlog("ADB: \"%s\" [%s]", label, dev->serial);
-        size_t idx = obs_property_list_add_string(p, label, dev->serial);
-        if (adbMgr->DeviceOffline(dev))
-            obs_property_list_item_disable(p, idx, true);
-    }
-
-    iosMgr->ResetIter();
-    while ((dev = iosMgr->NextDevice()) != NULL) {
-        iosMgr->GetModel(dev);
-        char *label = dev->model[0] != 0 ? dev->model : dev->serial;
-        dlog("IOS: handle:%d \"%s\" [%s]", dev->handle, label, dev->serial);
-        obs_property_list_add_string(p, label, dev->serial);
-    }
-
-    mdnsMgr->ResetIter();
-    while ((dev = mdnsMgr->NextDevice()) != NULL) {
-        char *label = dev->model[0] != 0 ? dev->model : dev->serial;
-        dlog("MDNS: \"%s\" [%s]", label, dev->serial);
-        obs_property_list_add_string(p, label, dev->serial);
-    }
-
-    obs_property_list_add_string(p, TEXT_USE_WIFI, opt_use_wifi);
-    obs_property_set_enabled(cp, true);
-    return true;
-}
-
-void source_update(void *data, obs_data_t *settings) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    plugin->deactivateWNS = obs_data_get_bool(settings, OPT_DEACTIVATE_WNS);
-    plugin->enable_audio  = obs_data_get_bool(settings, OPT_ENABLE_AUDIO);
-    plugin->use_hw = obs_data_get_bool(settings, OPT_USE_HW_ACCEL);
-    plugin->use_hdr = obs_data_get_bool(settings, OPT_USE_HDR);
-    bool sync_av = false; // obs_data_get_bool(settings, OPT_SYNC_AV);
-    bool activated = obs_data_get_bool(settings, OPT_IS_ACTIVATED);
-    bool unbuffered = obs_data_get_bool(settings, OPT_UNBUFFERED_OUT);
-
-    dlog("on source_update: activated=%d (actual=%d) audio=%d unbuffered=%d sync_av=%d",
-        plugin->activated,
-        activated,
-        plugin->enable_audio,
-        unbuffered,
-        sync_av);
-
-    obs_source_set_async_decoupled(plugin->source, !sync_av); // nb: only works when in unbuffered mode.
-    obs_source_set_async_unbuffered(plugin->source, unbuffered);
-
-    // handle [Cancel] case
-    if (activated != plugin->activated) {
-        plugin->activated = activated;
-    }
-}
-
-obs_properties_t *source_properties(void *data) {
-    droidcam_obs_source *plugin = (droidcam_obs_source*)(data);
-    obs_properties_t *ppts = obs_properties_create();
-    obs_property_t *cp;
-    bool activated = false;
-    bool uhd_unlock = false;
-
-    if (plugin) {
-        obs_data_t *settings = obs_source_get_settings(plugin->source);
-        activated = obs_data_get_bool(settings, OPT_IS_ACTIVATED);
-        #if DROIDCAM_OVERRIDE==0
-        uhd_unlock = obs_data_get_bool(settings, OPT_UHD_UNLOCK);
-        #endif
-        obs_data_release(settings);
-    }
-
-    ilog("source_properties: activated=%d, uhd_unlock=%d", activated, uhd_unlock);
-
-    cp = obs_properties_add_list(ppts, OPT_RESOLUTION_STR, TEXT_RESOLUTION,
-        #if DROIDCAM_OVERRIDE
-        OBS_COMBO_TYPE_LIST,
-        #else
-        OBS_COMBO_TYPE_EDITABLE,
-        #endif
-        OBS_COMBO_FORMAT_STRING);
-    for (size_t i = 0; i < ARRAY_LEN(Resolutions); i++) {
-        obs_property_list_add_string(cp, Resolutions[i], Resolutions[i]);
-        #if DROIDCAM_OVERRIDE==0
-        if (!uhd_unlock && i == RESOLUTION_1080) break;
-        #endif
-    }
-
-    obs_property_set_modified_callback2(cp, video_parms_changed, data);
-
-    cp = obs_properties_add_list(ppts, OPT_VIDEO_FORMAT, TEXT_VIDEO_FORMAT, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    for (size_t i = 0; i < ARRAY_LEN(VideoFormatNames); i++)
-        obs_property_list_add_int(cp, VideoFormatNames[i][0], i);
-
-    obs_property_set_modified_callback2(cp, video_parms_changed, data);
-
-    obs_properties_add_list(ppts, OPT_DEVICE_LIST, TEXT_DEVICE, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-    cp = obs_properties_get(ppts, OPT_DEVICE_LIST);
-    if (plugin) {
-        Device* dev;
-        AdbMgr *adbMgr = &plugin->adbMgr;
-        USBMux* iosMgr = &plugin->iosMgr;
-        MDNS  *mdnsMgr = &plugin->mdnsMgr;
-
-        adbMgr->ResetIter();
-        while ((dev = adbMgr->NextDevice()) != NULL) {
-            char *label = dev->model[0] != 0 ? dev->model : dev->serial;
-            size_t idx = obs_property_list_add_string(cp, label, dev->serial);
-            if (adbMgr->DeviceOffline(dev))
-                obs_property_list_item_disable(cp, idx, true);
-        }
-
-        iosMgr->ResetIter();
-        while ((dev = iosMgr->NextDevice()) != NULL) {
-            char *label = dev->model[0] != 0 ? dev->model : dev->serial;
-            obs_property_list_add_string(cp, label, dev->serial);
-        }
-
-        mdnsMgr->ResetIter();
-        while ((dev = mdnsMgr->NextDevice()) != NULL) {
-            char *label = dev->model[0] != 0 ? dev->model : dev->serial;
-            obs_property_list_add_string(cp, label, dev->serial);
-        }
-    }
-
-    obs_property_list_add_string(cp, TEXT_USE_WIFI, opt_use_wifi);
-    obs_properties_add_button(ppts, OPT_REFRESH, TEXT_REFRESH, refresh_clicked);
-    obs_properties_add_button(ppts, OPT_CONNECT, (activated ? TEXT_DEACTIVATE : TEXT_CONNECT), connect_clicked);
-
-    obs_properties_add_text(ppts, OPT_WIFI_IP, "WiFi IP", OBS_TEXT_DEFAULT);
-    obs_properties_add_int(ppts, OPT_APP_PORT, "DroidCam Port", 1, 65535, 1);
-
-    obs_properties_add_bool(ppts, OPT_ENABLE_AUDIO, TEXT_ENABLE_AUDIO);
-    // obs_properties_add_bool(ppts, OPT_SYNC_AV, TEXT_SYNC_AV);
-    #if DROIDCAM_OVERRIDE==0
-    obs_properties_add_bool(ppts, OPT_DEACTIVATE_WNS, TEXT_DWNS);
-    #endif
-
-    cp = obs_properties_add_bool(ppts, OPT_UNBUFFERED_OUT, TEXT_LATENCY_TOGGLE);
-    obs_property_set_long_description(cp, TEXT_LATENCY_DESCR);
-
-    obs_properties_add_bool(ppts, OPT_USE_HW_ACCEL, TEXT_USE_HW_ACCEL);
-    #if DROIDCAM_OVERRIDE==0 && LIBOBS_API_MAJOR_VER > 27
-    obs_properties_add_bool(ppts, OPT_USE_HDR, TEXT_USE_HDR);
-    #endif
-
-    if (activated) {
-        toggle_ppts(ppts, false);
-    }
-
-    return ppts;
-}
-
-void source_defaults(obs_data_t *settings) {
-    obs_data_set_default_bool(settings, OPT_DUMMY_SOURCE, false);
-    obs_data_set_default_bool(settings, OPT_UHD_UNLOCK, false);
-    obs_data_set_default_bool(settings, OPT_IS_ACTIVATED, false);
-    obs_data_set_default_bool(settings, OPT_SYNC_AV, false);
-    obs_data_set_default_bool(settings, OPT_USE_HDR, false);
-    obs_data_set_default_bool(settings, OPT_USE_HW_ACCEL, true);
-    obs_data_set_default_bool(settings, OPT_ENABLE_AUDIO, false);
-    obs_data_set_default_bool(settings, OPT_DEACTIVATE_WNS, false);
-    obs_data_set_default_bool(settings, OPT_UNBUFFERED_OUT, true);
-    obs_data_set_default_int(settings, OPT_APP_PORT, DEFAULT_PORT);
-    obs_data_set_default_string(settings, OPT_RESOLUTION_STR, Resolutions[0]);
+    if (plugin->encoder)
+        encoder_rtsp_close(plugin->encoder);
+    if (plugin->to_bgr)
+        sws_freeContext(plugin->to_bgr);
+    if (plugin->bgr_frame)
+        bfree(plugin->bgr_frame);
+    free(plugin->rtsp_url);
+    delete plugin;
 }

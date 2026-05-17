@@ -3,7 +3,7 @@
 #define __MJPEG_DECODE_H__
 
 extern "C" {
-#include <obs.h>
+#include "plugin.h"
 #include "turbojpeg.h"
 }
 

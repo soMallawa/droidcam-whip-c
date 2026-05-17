@@ -35,7 +35,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "device_discovery.h"
 #include "plugin.h"
 #include "plugin_properties.h"
-#include <util/platform.h>
 
 // Callback handling parsing answers to queries sent
 static int

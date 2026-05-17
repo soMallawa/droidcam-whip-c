@@ -24,6 +24,7 @@ void net_cleanup(void);
 void net_close(socket_t sock);
 socket_t net_accept(socket_t sock);
 
+#ifdef __cplusplus
 socket_t
 net_connect(struct addrinfo *addr, struct sockaddr* bind_saddr, uint16_t port);
 
@@ -32,6 +33,7 @@ net_connect(const char* host, const char* bindIP, uint16_t port);
 
 inline socket_t
 net_connect(const char* host, uint16_t port) { return net_connect(host, NULL, port); }
+#endif
 
 socket_t
 net_listen(const char* addr, uint16_t port);

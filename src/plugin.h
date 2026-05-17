@@ -7,7 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #define PLUGIN_VERSION_STR "250"
 
@@ -39,13 +43,27 @@ static inline void *bmalloc(size_t size) { return malloc(size); }
 static inline void *brealloc(void *ptr, size_t size) { return realloc(ptr, size); }
 static inline void bfree(void *ptr) { free(ptr); }
 
+#ifdef _WIN32
+static inline void os_sleep_ms(uint32_t ms) { Sleep((DWORD)ms); }
+#else
 static inline void os_sleep_ms(uint32_t ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
+#ifdef _WIN32
+static inline uint64_t os_gettime_ns(void) {
+    static LARGE_INTEGER freq = {0};
+    LARGE_INTEGER counter;
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (uint64_t)(counter.QuadPart * 1000000000ULL / freq.QuadPart);
+}
+#else
 static inline uint64_t os_gettime_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
 }
+#endif
 
 static inline char *obs_module_file(const char *path) {
     size_t len = strlen(path) + 1;

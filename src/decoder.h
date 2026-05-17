@@ -45,9 +45,9 @@ struct DataPacket {
     }
 
     void resize(size_t new_size) {
-        if (size < new_size){
-            data = (uint8_t*) brealloc(data, new_size);
-            size = new_size;
+        if (size < new_size) {
+            uint8_t *tmp = (uint8_t*) brealloc(data, new_size);
+            if (tmp) { data = tmp; size = new_size; }
         }
     }
 };

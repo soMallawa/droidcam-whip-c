@@ -17,9 +17,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "plugin.h"
 #include "mjpeg_decode.h"
 
+#ifdef _MSC_VER
 extern "C" {
     FILE __iob_func[3] = { *stdin,*stdout,*stderr };
 }
+#endif
 
 MJpegDecoder::~MJpegDecoder(void) {
     if (frameBuf)

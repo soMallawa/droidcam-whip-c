@@ -65,7 +65,7 @@ static int init_encoder(EncoderRtspCtx *ctx, const char *name) {
     ctx->codec_ctx->bit_rate = 4000000;
     ctx->codec_ctx->rc_max_rate = 4000000;
     ctx->codec_ctx->rc_buffer_size = 4000000;
-    ctx->codec_ctx->gop_size = ctx->fps;
+    ctx->codec_ctx->gop_size = ctx->fps / 2 > 0 ? ctx->fps / 2 : 1;
     ctx->codec_ctx->max_b_frames = 0;
     ctx->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
@@ -157,7 +157,11 @@ static int open_output(EncoderRtspCtx *ctx) {
     if (ret < 0)
         return ret;
 
+    ctx->fmt_ctx->max_delay = 0;
     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    av_dict_set(&opts, "flush_packets", "1", 0);
+    av_dict_set(&opts, "pkt_size", "1400", 0);
     if (!(ctx->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open2(&ctx->fmt_ctx->pb, ctx->url, AVIO_FLAG_WRITE, NULL, &opts);
         if (ret < 0) {

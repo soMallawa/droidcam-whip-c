@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$msysRoot = "C:\msys64"
+$msysRoot = "D:\msys64"
 $bash = Join-Path $msysRoot "usr\bin\bash.exe"
 
 if (-not (Test-Path $bash)) {
@@ -21,7 +21,7 @@ if ($msysProjectPath -match "^([A-Za-z]):/(.*)$") {
 $command = @"
 set -e
 cd '$msysProjectPath'
-pacman -S --needed --noconfirm mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-libturbojpeg mingw-w64-x86_64-cmake mingw-w64-x86_64-toolchain mingw-w64-x86_64-libimobiledevice mingw-w64-x86_64-libusbmuxd
+pacman -S --needed --noconfirm mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-libjpeg-turbo mingw-w64-x86_64-cmake mingw-w64-x86_64-toolchain mingw-w64-x86_64-libimobiledevice mingw-w64-x86_64-libusbmuxd
 mkdir -p build
 cd build
 cmake .. -G 'MinGW Makefiles' -DCMAKE_BUILD_TYPE=Release
@@ -29,4 +29,5 @@ mingw32-make
 cp droidcam-whip.exe ..
 "@
 
+$env:MSYSTEM = "MINGW64"
 & $bash -lc $command

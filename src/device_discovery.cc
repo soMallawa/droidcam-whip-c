@@ -21,7 +21,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <assert.h>
-#elif defined(TEST)
+#else
 #include <cassert>
 #endif
 
@@ -421,7 +421,7 @@ USBMux::USBMux() : iproxy(this) {
         "imobiledevice.dll",
     };
 
-    SetDllDirectory(obs_get_module_data_path((obs_current_module())));
+    SetDllDirectory(NULL);
 
     for (size_t i = 0; i < ARRAY_LEN(IMOBILEDEV_VARIANTS); i++) {
         FreeAll();

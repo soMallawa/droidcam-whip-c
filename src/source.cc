@@ -111,7 +111,7 @@ static socket_t connect_device(struct droidcam_obs_source *plugin) {
         return net_connect(device_info->ip, bindIP, device_info->port);
     }
 
-    if (device_info->type == MDNS) {
+    if (device_info->type == MDNS_WIFI) {
         dev = mdnsMgr->GetDevice(device_info->id);
         if (dev) {
             return net_connect(dev->address, bindIP, device_info->port);
@@ -303,6 +303,14 @@ static bool frame_to_bgr(droidcam_obs_source *plugin, const struct obs_source_fr
 }
 
 static bool push_video_frame(droidcam_obs_source *plugin, const struct obs_source_frame2 *frame, uint64_t pts) {
+    if (!frame_to_bgr(plugin, frame))
+        return false;
+
+    if (plugin->preview_callback) {
+        plugin->preview_callback(plugin->preview_userdata, plugin->bgr_frame,
+            (int)frame->width, (int)frame->height);
+    }
+
     if (!plugin->encoder || plugin->video_width != (int)frame->width || plugin->video_height != (int)frame->height) {
         if (plugin->encoder)
             encoder_rtsp_close(plugin->encoder);
@@ -312,14 +320,6 @@ static bool push_video_frame(droidcam_obs_source *plugin, const struct obs_sourc
         plugin->encoder = encoder_rtsp_init(plugin->rtsp_url, plugin->video_width, plugin->video_height, plugin->fps);
         if (!plugin->encoder)
             return false;
-    }
-
-    if (!frame_to_bgr(plugin, frame))
-        return false;
-
-    if (plugin->preview_callback) {
-        plugin->preview_callback(plugin->preview_userdata, plugin->bgr_frame,
-            (int)frame->width, (int)frame->height);
     }
 
     return encoder_rtsp_encode_frame(plugin->encoder, plugin->bgr_frame, (int64_t)pts) >= 0;
@@ -448,7 +448,7 @@ static void *video_thread(void *data) {
 
     if (plugin->activated) {
         switch (plugin->device_info.type) {
-            case MDNS:
+            case MDNS_WIFI:
                 plugin->mdnsMgr.Reload();
                 plugin->mdnsMgr.ResetIter();
                 break;

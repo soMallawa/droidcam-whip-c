@@ -12,7 +12,7 @@ enum DeviceType {
     WIFI,
     ADB,
     IOS,
-    MDNS,
+    MDNS_WIFI,
 };
 
 struct active_device_info {

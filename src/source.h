@@ -1,6 +1,8 @@
 // Copyright (C) 2023 DEV47APPS, github.com/dev47apps
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -37,6 +39,8 @@ struct droidcam_source_config {
     int use_hw;
     int use_hdr;
     const char *rtsp_url;
+    void (*preview_callback)(void *userdata, const uint8_t *bgr_data, int width, int height);
+    void *preview_userdata;
 };
 
 void *droidcam_source_start(const struct droidcam_source_config *config);

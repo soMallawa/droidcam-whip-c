@@ -57,6 +57,8 @@ struct droidcam_obs_source {
     struct obs_source_frame2 video_frame;
     EncoderRtspCtx *encoder;
     char *rtsp_url;
+    void (*preview_callback)(void *userdata, const uint8_t *bgr_data, int width, int height);
+    void *preview_userdata;
     uint8_t *bgr_frame;
     size_t bgr_frame_size;
     struct SwsContext *to_bgr;
@@ -82,6 +84,8 @@ struct droidcam_obs_source {
           video_format(FORMAT_AVC),
           encoder(NULL),
           rtsp_url(NULL),
+          preview_callback(NULL),
+          preview_userdata(NULL),
           bgr_frame(NULL),
           bgr_frame_size(0),
           to_bgr(NULL),
@@ -313,6 +317,11 @@ static bool push_video_frame(droidcam_obs_source *plugin, const struct obs_sourc
     if (!frame_to_bgr(plugin, frame))
         return false;
 
+    if (plugin->preview_callback) {
+        plugin->preview_callback(plugin->preview_userdata, plugin->bgr_frame,
+            (int)frame->width, (int)frame->height);
+    }
+
     return encoder_rtsp_encode_frame(plugin->encoder, plugin->bgr_frame, (int64_t)pts) >= 0;
 }
 
@@ -538,7 +547,9 @@ void *droidcam_source_start(const struct droidcam_source_config *config) {
     plugin->device_info.id = config->device_id ? config->device_id : config->device_ip;
     plugin->device_info.ip = config->device_ip;
     plugin->device_info.port = config->port;
-    plugin->rtsp_url = strdup(config->rtsp_url);
+    plugin->rtsp_url = strdup(config->rtsp_url ? config->rtsp_url : "rtsp://127.0.0.1:8554/cam_in");
+    plugin->preview_callback = config->preview_callback;
+    plugin->preview_userdata = config->preview_userdata;
 
     ilog("Source: video_format=%s video_resolution=%dx%d rtsp=%s",
         VideoFormatNames[plugin->video_format][1],
